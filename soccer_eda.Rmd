@@ -1,0 +1,318 @@
+---
+title: "What Drives Match Outcomes and Goal Trends in European Soccer?"
+subtitle: "Exploratory Data Analysis: European Soccer Database (2008-2016)"
+author: "Your Name Here"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5)
+library(DBI)
+library(RSQLite)
+library(tidyverse)
+library(knitr)
+```
+
+# 1. Introduction
+
+This report is the first exploratory look at the **European Soccer Database** on Kaggle (created by Hugo Mathien). The data covers matches from 11 European leagues between the 2008/2009 and 2015/2016 seasons. My project asks whether playing at home gives a measurable scoring advantage, how scoring differs across leagues and seasons, and whether betting odds reliably predict results.
+
+The data comes as a SQLite database file. All of the match-level information used here is in the `Match` table, and league names come from the `League` table.
+
+```{r load-data}
+# Connect to the database (database.sqlite must be in the same folder as this .Rmd)
+con <- dbConnect(SQLite(), "database.sqlite")
+
+# Dimensions of the ORIGINAL Match table, before I select columns
+orig_rows <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM Match")$n
+orig_cols <- nrow(dbGetQuery(con, "PRAGMA table_info(Match)"))
+
+# Pull only the columns I need (the XML text columns are left out on purpose)
+soccer <- dbGetQuery(con, "
+  SELECT id, country_id, league_id, season, date,
+         home_team_api_id, away_team_api_id,
+         home_team_goal, away_team_goal,
+         B365H, B365D, B365A
+  FROM Match
+")
+
+leagues <- dbGetQuery(con, "SELECT id AS league_id, name AS league_name FROM League")
+dbDisconnect(con)
+
+# Add league names, fix the date column, and create new features
+soccer <- soccer %>%
+  left_join(leagues, by = "league_id") %>%
+  mutate(
+    date = as.Date(date),
+    goal_diff = home_team_goal - away_team_goal,
+    total_goals = home_team_goal + away_team_goal,
+    result = case_when(
+      goal_diff > 0 ~ "Home win",
+      goal_diff < 0 ~ "Away win",
+      TRUE ~ "Draw"
+    )
+  )
+```
+
+# 2. Dimensions of the Data
+
+```{r dimensions}
+dims <- tibble(
+  Dataset = c("Original Match table", "Working data frame used in this report"),
+  Rows = c(orig_rows, nrow(soccer)),
+  Columns = c(orig_cols, ncol(soccer))
+)
+kable(dims, format.args = list(big.mark = ","))
+```
+
+The original `Match` table has **`r format(orig_rows, big.mark = ",")` rows** (one per match) and **`r orig_cols` columns**. Most of those columns describe individual players and detailed match events, which I am not using yet. My working data frame keeps all `r format(nrow(soccer), big.mark = ",")` matches but only `r ncol(soccer)` columns: the ones I selected plus the four features I created (`league_name`, `goal_diff`, `total_goals`, and `result`).
+
+# 3. Data Dictionary
+
+The table below describes every feature in my working data frame. "Type" is the statistical type: numerical (a quantity where math makes sense) or categorical (a label or group). Some columns are stored as numbers in the database but are really labels, such as ID codes, so I classify them as categorical.
+
+```{r dictionary}
+dictionary <- tribble(
+  ~Variable,           ~Description,                                                          ~Type,
+  "id",                "Unique row number for each match (identifier only)",                  "Categorical (identifier)",
+  "country_id",        "Code for the country the match was played in",                        "Categorical",
+  "league_id",         "Code for the league (matches the League table)",                      "Categorical",
+  "league_name",       "Name of the league, added by joining the League table",               "Categorical",
+  "season",            "Season the match belongs to, e.g. 2008/2009",                         "Categorical (ordered)",
+  "date",              "Date of the match, converted from text to a Date",                    "Date / time",
+  "home_team_api_id",  "ID code of the home team",                                            "Categorical",
+  "away_team_api_id",  "ID code of the away team",                                            "Categorical",
+  "home_team_goal",    "Goals scored by the home team",                                       "Numerical (discrete)",
+  "away_team_goal",    "Goals scored by the away team",                                       "Numerical (discrete)",
+  "B365H",             "Bet365 decimal odds for a home win",                                  "Numerical (continuous)",
+  "B365D",             "Bet365 decimal odds for a draw",                                      "Numerical (continuous)",
+  "B365A",             "Bet365 decimal odds for an away win",                                 "Numerical (continuous)",
+  "goal_diff",         "Created: home_team_goal minus away_team_goal",                        "Numerical (discrete)",
+  "total_goals",       "Created: home_team_goal plus away_team_goal",                         "Numerical (discrete)",
+  "result",            "Created: Home win, Away win, or Draw",                                "Categorical"
+)
+kable(dictionary)
+```
+
+**Columns I left out for now:** `shoton`, `foulcommit`, `corner`, and similar event columns are stored in the database as long XML text strings rather than numbers, and many are empty. They would need to be parsed before I could analyze shots or corners, so I am saving them for a later stage of the project. The team and player attribute tables are also unused so far.
+
+# 4. Summary Statistics
+
+## 4.1 Numerical features
+
+```{r numeric-summary}
+num_summary <- soccer %>%
+  select(home_team_goal, away_team_goal, total_goals, goal_diff,
+         B365H, B365D, B365A) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarize(
+    n_missing = sum(is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE)
+  )
+kable(num_summary, digits = 2)
+```
+
+This table gives the center and spread of each numerical feature. The goal columns have no missing values, and home teams average **`r round(mean(soccer$home_team_goal), 2)`** goals per match compared with **`r round(mean(soccer$away_team_goal), 2)`** for away teams. A typical match has about **`r round(mean(soccer$total_goals), 2)`** goals in total. The betting odds columns have a much wider range than the goal columns, which makes sense because odds for a big underdog can be very high. The `n_missing` column also shows that the odds are the only numerical features with missing values.
+
+### Goals scored
+
+```{r goals-hist}
+soccer %>%
+  select(home_team_goal, away_team_goal) %>%
+  pivot_longer(everything(), names_to = "side", values_to = "goals") %>%
+  mutate(side = if_else(side == "home_team_goal", "Home", "Away")) %>%
+  ggplot(aes(x = goals, fill = side)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Distribution of Goals Scored per Team per Match",
+       x = "Goals scored", y = "Number of matches", fill = "Team") +
+  theme_minimal()
+```
+
+This bar chart counts how many matches ended with 0, 1, 2, 3, and more goals for each side. Because goals are whole numbers, I used bars instead of a smooth histogram. Both distributions peak at low values and have a long tail to the right, so high-scoring games are rare. The home bars are lower at 0 goals and higher at 2 and 3 goals than the away bars, which is the first visual sign of home advantage.
+
+### Total goals and goal difference
+
+```{r total-hist}
+ggplot(soccer, aes(x = total_goals)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Total Goals per Match (Home + Away)",
+       x = "Total goals", y = "Number of matches") +
+  theme_minimal()
+```
+
+This chart shows the combined goals in each match. The most common totals are small numbers, and the distribution is skewed to the right, with a few matches reaching very high totals. This matches the idea from my proposal that soccer is a low-scoring sport.
+
+```{r diff-hist}
+ggplot(soccer, aes(x = goal_diff)) +
+  geom_bar(fill = "darkorange") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Goal Difference per Match (Home - Away)",
+       x = "Goal difference", y = "Number of matches") +
+  theme_minimal()
+```
+
+Here the dashed line marks a draw. If neither side had an advantage, the bars would be symmetric around zero. Instead, more of the mass sits to the right of the line, meaning home teams win by more goals than away teams do. The average goal difference is **`r round(mean(soccer$goal_diff), 2)`**.
+
+### Betting odds
+
+```{r odds-hist}
+ggplot(soccer, aes(x = B365H)) +
+  geom_histogram(binwidth = 0.25, fill = "seagreen", na.rm = TRUE) +
+  coord_cartesian(xlim = c(1, 12)) +
+  labs(title = "Bet365 Odds for a Home Win",
+       x = "Decimal odds (B365H)", y = "Number of matches") +
+  theme_minimal()
+```
+
+This histogram shows the odds Bet365 offered on a home win. Low odds mean the bookmaker thought the home team was a strong favorite. Most matches have fairly low odds, with a long tail of matches where the home team was a big underdog. I limited the x-axis to 12 so the tail does not squash the main part of the chart, so a handful of extreme values are cut off from the picture (they are still in the data).
+
+## 4.2 Categorical features
+
+```{r result-table}
+result_table <- soccer %>%
+  count(result) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n))
+kable(result_table, col.names = c("Result", "Matches", "Percent"),
+      format.args = list(big.mark = ","))
+```
+
+This table shows how often each outcome happened across all leagues. Home wins are the most common result at about **`r result_table$percent[result_table$result == "Home win"]`%**, then away wins and draws. Home wins happen noticeably more often than away wins, which supports the home advantage idea.
+
+```{r league-table}
+league_table <- soccer %>%
+  count(league_name) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n))
+kable(league_table, col.names = c("League", "Matches", "Percent"),
+      format.args = list(big.mark = ","))
+```
+
+This table shows how many matches each league contributes. The biggest leagues (the ones with 20 teams playing 38 games each) have the most rows, and the smaller leagues have fewer. The leagues are therefore not equally represented, so any combined overall average is weighted toward the larger leagues.
+
+```{r season-table}
+season_table <- soccer %>%
+  count(season) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+kable(season_table, col.names = c("Season", "Matches", "Percent"),
+      format.args = list(big.mark = ","))
+```
+
+This table checks that every season has a similar number of matches. If one season had far fewer rows, comparisons across seasons would be less reliable.
+
+## 4.3 Home advantage by league (preview)
+
+```{r league-summary}
+league_summary <- soccer %>%
+  group_by(league_name) %>%
+  summarize(
+    matches = n(),
+    avg_home_goals = mean(home_team_goal),
+    avg_away_goals = mean(away_team_goal),
+    avg_goal_diff = mean(goal_diff),
+    home_win_pct = mean(result == "Home win") * 100
+  ) %>%
+  arrange(desc(avg_goal_diff))
+kable(league_summary, digits = 2)
+```
+
+```{r league-plot}
+ggplot(league_summary, aes(x = reorder(league_name, avg_goal_diff), y = avg_goal_diff)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Home Advantage by League",
+       x = NULL, y = "Average goal difference (home - away)") +
+  theme_minimal()
+```
+
+This table and chart show the average goal difference (home minus away) for each league. The value is positive in every league, so home advantage appears everywhere in this data. The league at the top is **`r league_summary$league_name[1]`** (about `r round(league_summary$avg_goal_diff[1], 2)` goals per match) and the league at the bottom is **`r league_summary$league_name[nrow(league_summary)]`** (about `r round(league_summary$avg_goal_diff[nrow(league_summary)], 2)`). Several leagues in the middle are very close to one another, so I would not trust a precise ranking without a statistical test.
+
+# 5. Data Cleanliness
+
+## 5.1 Missing values
+
+```{r missing}
+missing_table <- tibble(
+  variable = names(soccer),
+  n_missing = colSums(is.na(soccer)),
+  percent_missing = round(100 * colSums(is.na(soccer)) / nrow(soccer), 2)
+) %>%
+  arrange(desc(n_missing))
+kable(missing_table)
+```
+
+Only the three betting odds columns have missing values (about **`r round(100 * mean(is.na(soccer$B365H)), 1)`%** of matches are missing `B365H`). The goals, dates, seasons, and league columns are complete. When I analyze betting odds, I drop matches with missing odds, but I keep all matches for the goal-based analysis.
+
+## 5.2 Other checks
+
+```{r checks}
+checks <- tibble(
+  Check = c("Duplicate match ids",
+            "Matches with a negative goal count",
+            "Matches with odds below 1.0 (impossible for decimal odds)",
+            "Matches with a missing date after conversion",
+            "Rows removed from the working data frame"),
+  Result = c(sum(duplicated(soccer$id)),
+             sum(soccer$home_team_goal < 0 | soccer$away_team_goal < 0),
+             sum(soccer$B365H < 1 | soccer$B365D < 1 | soccer$B365A < 1, na.rm = TRUE),
+             sum(is.na(soccer$date)),
+             orig_rows - nrow(soccer))
+)
+kable(checks)
+```
+
+These checks look for problems that would quietly break an analysis. Any value above zero in the Result column would need a closer look. I did not remove any observations from the main data. For the betting odds analysis, I only exclude matches that have no odds.
+
+## 5.3 Spelling, naming, and hard-to-understand variables
+
+- **League names** include the country as a prefix (for example "Spain LIGA BBVA" and "England Premier League"), and some are long, which makes chart labels crowded. I may shorten them later.
+- **Team columns** (`home_team_api_id`, `away_team_api_id`) are just ID numbers, not team names. To say which teams did well, I will need to join the `Team` table.
+- **`season`** is stored as text like "2008/2009", which sorts correctly in order but is not a number.
+- **`date`** was stored as text and I converted it to a proper Date.
+- **Betting odds** are stored as decimal odds, which are not intuitive at first. I plan to convert them into implied probabilities (1 divided by the odds, then rescaled so the three probabilities add to 1).
+- **Event columns** (`shoton`, `corner`, `foulcommit`) are XML text and will need parsing before use.
+
+## 5.4 Correlated features
+
+```{r correlation}
+cor_data <- soccer %>%
+  select(home_team_goal, away_team_goal, total_goals, goal_diff, B365H, B365D, B365A)
+
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+cor_long <- as.data.frame(as.table(cor_matrix))
+names(cor_long) <- c("var1", "var2", "correlation")
+
+ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation Between Numerical Features", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This heatmap shows how strongly pairs of numerical features move together. Values near 1 or -1 mean a strong relationship, and values near 0 mean little relationship. Some of the strong correlations are built in by how I made the features: `total_goals` and `goal_diff` are calculated from the two goal columns, so they are naturally related to them. The more interesting pattern is between the odds and the goals. `B365H` (home win odds) is expected to correlate negatively with `goal_diff`, because low odds mean the home team was a favorite and favorites tend to win by more. The three odds columns are also related to each other, since a short price on one outcome means long prices on the others.
+
+# 6. Discussion
+
+Overall, the data is in good shape for the questions I want to ask. It is large (over 25,000 matches), the key columns for goals, leagues, seasons, and dates are complete, and I found no duplicates or impossible values. The clearest finding so far is that home advantage shows up in every league: home teams score more than away teams on average, home wins are the most common result, and the average goal difference is positive everywhere. The size of the advantage varies by league, with Spain and the Netherlands near the top and Scotland near the bottom, but several leagues are close enough that I cannot say their order is meaningful yet. Scoring levels also differ by league, and the match count per league is uneven, so combined averages lean toward the biggest leagues. My first look at the season-by-season averages did not show a steady rise or fall in goals per match, just small ups and downs from year to year, which suggests scoring was fairly stable over this period. I want to confirm that with a closer look at the scale of the chart.
+
+I also have some concerns about the data. The betting odds come from one bookmaker and are missing for some matches, so conclusions about "the betting market" are limited. The team columns are only ID codes, and the shot, corner, and foul columns are stored as XML text, so a big part of my original plan (relating shots on target and corners to goals) cannot be done until I parse them. I also have not run any statistical tests, so I can describe differences but cannot yet say whether they are larger than chance. For next steps, I plan to (1) explore home advantage over time within each league using a line chart, (2) test whether the differences between leagues are statistically meaningful, for example with confidence intervals or a simple test, (3) convert the betting odds into implied probabilities and check how well they match actual results, since this is the question I am most curious about, and (4) try parsing the XML columns for corners and shots on target so I can compare them with goals. I chose these because they build directly on the patterns I found here and match the objectives in my proposal.
+
+# References
+
+Mathien, H. *European Soccer Database*. Kaggle. https://www.kaggle.com/datasets/hugomathien/soccer
